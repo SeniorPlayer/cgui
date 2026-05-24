@@ -24,6 +24,20 @@ pub enum Event {
         message: String,
     },
     Status(String),
+    Updates(Vec<crate::update::UpdateInfo>),
+}
+
+/// Spawn a one-shot update check at startup. Future iterations will poll on
+/// an interval; phase 1 keeps it to a single startup probe so failures are
+/// silent and bounded.
+pub fn spawn_update_check(tx: UnboundedSender<Event>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut prefs = crate::prefs::Prefs::load();
+        let updates = crate::update::check(&mut prefs).await;
+        if !updates.is_empty() {
+            let _ = tx.send(Event::Updates(updates));
+        }
+    })
 }
 
 /// Spawn the FSEvents watcher in a blocking thread; events flow through `tx`.
@@ -63,16 +77,29 @@ pub fn spawn_restart_health(tx: UnboundedSender<Event>) -> tokio::task::JoinHand
         // Per (stack, svc): when last health probe fired.
         let mut last_probe: std::collections::HashMap<(String, String), Instant> =
             std::collections::HashMap::new();
+        // Per (stack, svc): when we first noticed the container existed.
+        // Used by Healthcheck.start_period_s to mask probe failures during
+        // the initial grace window.
+        let mut first_seen: std::collections::HashMap<(String, String), Instant> =
+            std::collections::HashMap::new();
         let mut tick = tokio::time::interval(Duration::from_secs(10));
         loop {
             tick.tick().await;
             let stacks_now = stacks::load_all();
             for stack in &stacks_now {
                 for svc in &stack.services {
+                    // Track first-seen for the start-period grace, regardless
+                    // of restart policy.
+                    let cname = stacks::container_name(&stack.name, &svc.name);
+                    let key = (stack.name.clone(), svc.name.clone());
+                    let exists = container_state(&cname).await;
+                    if exists.is_some() && !first_seen.contains_key(&key) {
+                        first_seen.insert(key.clone(), Instant::now());
+                    }
+
                     // --- restart policy ---
                     if matches!(svc.restart_policy(), RestartPolicy::Always | RestartPolicy::OnFailure) {
-                        let name = stacks::container_name(&stack.name, &svc.name);
-                        if let Some(state) = container_state(&name).await {
+                        if let Some(state) = exists.as_deref() {
                             let should_restart = match svc.restart_policy() {
                                 RestartPolicy::Always => state == "stopped" || state == "exited",
                                 RestartPolicy::OnFailure => state == "exited",
@@ -81,15 +108,17 @@ pub fn spawn_restart_health(tx: UnboundedSender<Event>) -> tokio::task::JoinHand
                             if should_restart {
                                 let _ = tx.send(Event::Status(format!(
                                     "restart: {} ({state}) → start",
-                                    name
+                                    cname
                                 )));
-                                let _ = run_start(&name).await;
+                                let _ = run_start(&cname).await;
+                                // Reset the grace window — a fresh start
+                                // deserves the same kindness.
+                                first_seen.insert(key.clone(), Instant::now());
                             }
                         }
                     }
                     // --- healthcheck ---
                     if let Some(hc) = &svc.healthcheck {
-                        let key = (stack.name.clone(), svc.name.clone());
                         let due = match last_probe.get(&key) {
                             Some(t) => t.elapsed() >= Duration::from_secs(hc.interval_s.max(1)),
                             None => true,
@@ -98,7 +127,24 @@ pub fn spawn_restart_health(tx: UnboundedSender<Event>) -> tokio::task::JoinHand
                             continue;
                         }
                         last_probe.insert(key.clone(), Instant::now());
-                        let (ok, message) = probe(stack, svc, hc).await;
+                        let (mut ok, mut message) = probe(stack, svc, hc).await;
+
+                        // Apply start_period_s grace: while inside the
+                        // window from first_seen, mask failures as
+                        // "starting (N/M s)" so the row doesn't pulse red
+                        // during legitimate boot.
+                        if hc.start_period_s > 0 && !ok {
+                            if let Some(start) = first_seen.get(&key) {
+                                let elapsed = start.elapsed().as_secs();
+                                if elapsed < hc.start_period_s {
+                                    ok = true;
+                                    message = format!(
+                                        "starting ({elapsed}/{}s) — {message}",
+                                        hc.start_period_s
+                                    );
+                                }
+                            }
+                        }
                         let _ = tx.send(Event::Health {
                             stack: stack.name.clone(),
                             service: svc.name.clone(),
@@ -181,22 +227,27 @@ async fn probe_tcp(svc: &Service, hc: &Healthcheck) -> (bool, String) {
     }
 }
 
-/// HTTP healthcheck. `target` accepts:
-///   * `"PORT"`            → http://127.0.0.1:PORT/
-///   * `"PORT/PATH"`       → http://127.0.0.1:PORT/PATH
-///   * `"http://host:port/path"` → used verbatim (https not supported here)
+/// HTTP / HTTPS healthcheck. `target` accepts:
+///   * `"PORT"`              → http://127.0.0.1:PORT/
+///   * `"PORT/PATH"`         → http://127.0.0.1:PORT/PATH
+///   * `"http://host:port/path"`  → plain HTTP/1.0, hand-rolled client
+///   * `"https://host:port/path"` → shell out to `curl --silent --max-time 2 -o /dev/null -w "%{http_code}"`
 ///
 /// Success = response status is in `expect_status[0]..=expect_status[1]`,
-/// or 200..399 if not specified. We talk minimal HTTP/1.0 against a
-/// `tokio::net::TcpStream`, no TLS, no extra dependency.
+/// or 200..399 if not specified. We avoid pulling in a TLS dependency by
+/// reusing macOS's built-in `curl` for the HTTPS branch — same approach
+/// the update module uses for GitHub API calls.
 async fn probe_http(svc: &Service, hc: &Healthcheck) -> (bool, String) {
     let raw = match hc.target.as_deref() {
         Some(t) if !t.is_empty() => t.to_string(),
         _ => match svc.ports.first() {
             Some(p) => p.split(':').next().unwrap_or("").to_string(),
-            None => return (false, "no http target and no published port".into()),
+            None => return (false, "no http/https target and no published port".into()),
         },
     };
+    if raw.starts_with("https://") {
+        return probe_https_via_curl(&raw, hc).await;
+    }
     let (host, port, path) = parse_http_target(&raw);
     let addr = format!("{host}:{port}");
     let timeout = Duration::from_secs(2);
@@ -245,6 +296,36 @@ async fn probe_http(svc: &Service, hc: &Healthcheck) -> (bool, String) {
         Some(c) if c >= lo && c <= hi => (true, format!("http {addr}{path} → {c}")),
         Some(c) => (false, format!("http {addr}{path} → {c} (expected {lo}-{hi})")),
         None => (false, format!("http {addr}{path}: malformed response: {first}")),
+    }
+}
+
+/// HTTPS branch via `curl`. Returns just the status code; we don't bother
+/// reading the body. `--max-time 2` keeps us bounded; `-o /dev/null` drops
+/// the body to avoid slurping large responses into memory.
+async fn probe_https_via_curl(url: &str, hc: &Healthcheck) -> (bool, String) {
+    let timeout = std::time::Duration::from_secs(3);
+    let fut = tokio::process::Command::new("curl")
+        .args([
+            "-s", "-S", "--max-time", "2", "-o", "/dev/null",
+            "-w", "%{http_code}", url,
+        ])
+        .output();
+    let out = match tokio::time::timeout(timeout, fut).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => return (false, format!("https {url}: spawn {e}")),
+        Err(_) => return (false, format!("https {url}: outer timeout")),
+    };
+    let status_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !out.status.success() && status_str.is_empty() {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return (false, format!("https {url}: curl {err}"));
+    }
+    let code: Option<u16> = status_str.parse().ok();
+    let (lo, hi) = expected_range(hc);
+    match code {
+        Some(c) if c >= lo && c <= hi => (true, format!("https {url} → {c}")),
+        Some(c) => (false, format!("https {url} → {c} (expected {lo}-{hi})")),
+        None => (false, format!("https {url}: malformed status {status_str:?}")),
     }
 }
 

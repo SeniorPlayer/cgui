@@ -54,6 +54,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Mode::PromptStackName => draw_stack_name_prompt(f, app, area),
         Mode::TrivyResult => draw_trivy_result(f, app, area),
         Mode::Confirm => draw_confirm_overlay(f, app, area),
+        Mode::UpdatePrompt => draw_update_prompt(f, app, area),
+        Mode::StackDiff => draw_stack_diff(f, app, area),
         Mode::Browse | Mode::Filter | Mode::LogSearch => {}
     }
 }
@@ -885,6 +887,24 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         format!(" {} ", app.status),
         Style::default().fg(Color::Black).bg(Color::White),
     )];
+    // Update-available chip(s). One per component that's behind and not
+    // dismissed for this session, on theme.info so it doesn't collide with
+    // pull/build (warning) or success chips.
+    for u in app.visible_updates() {
+        let chip = format!(
+            " ⬆ {} {} → {} · U to view ",
+            u.component.label(),
+            u.installed,
+            u.latest
+        );
+        spans.push(Span::styled(
+            chip,
+            Style::default()
+                .fg(Color::Black)
+                .bg(app.theme.info)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     // Background-pull indicator: visible whenever a pull is running OR finished
     // but not currently focused, prompting the user to re-attach with `P`.
     if app.pull_attachable() && app.mode != Mode::PullProgress {
@@ -1059,6 +1079,8 @@ fn draw_help_overlay(f: &mut Frame, app: &App, area: Rect) {
     lines.push(h("a", "Toggle show-all vs running-only"));
     lines.push(h("?", "Toggle this help"));
     lines.push(h("X", "Switch runtime profile (container/docker/…)"));
+    lines.push(h("--profile", "CLI: one-shot runtime override (no persist)"));
+    lines.push(h("U", "View available updates (when chip is shown)"));
     lines.push(h("Mouse L/R", "Click row · right-click for menu · wheel scrolls"));
     lines.push(Line::from(""));
 
@@ -1095,21 +1117,26 @@ fn draw_help_overlay(f: &mut Frame, app: &App, area: Rect) {
             lines.push(h("L", "Multi-follow logs from EVERY service (prefixed)"));
             lines.push(h("n", "New stack (template + open in $EDITOR)"));
             lines.push(h("E", "Edit selected stack in $EDITOR"));
+            lines.push(h("=", "Diff: TOML vs running containers (live inspect)"));
+            lines.push(h("CLI", "`cgui new <name> --template postgres+api`"));
             lines.push(h("auto", "Stack files reload on disk change (FSEvents)"));
             lines.push(h("auto", "restart=always|on-failure re-runs stopped svcs"));
-            lines.push(h("auto", "[service.healthcheck] kind=tcp|cmd · interval_s"));
+            lines.push(h("auto", "[service.healthcheck] tcp|http|https|cmd + start_period_s"));
+            lines.push(h("auto", "service.cap_add / cap_drop append --cap-add/drop"));
         }
         Tab::Logs => {
             lines.push(section("Logs"));
             lines.push(h("/", "Search-as-you-type (highlight matches)"));
             lines.push(h("Ctrl-R", "Toggle regex search mode"));
             lines.push(h("F", "Toggle follow stream on/off"));
+            lines.push(h("y", "Copy log buffer to pbcopy"));
             lines.push(h("Esc", "Clear search"));
         }
     }
     lines.push(Line::from(""));
     lines.push(section("Pull modal"));
     lines.push(h("Esc", "Background the modal (status bar chip + P to re-attach)"));
+    lines.push(h("y", "Copy op log to pbcopy"));
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "  Press ? or Esc to close",
@@ -1488,6 +1515,271 @@ fn severity_colors(app: &App, s: Severity) -> (Color, Color) {
         Severity::Low => (Color::Black, app.theme.muted),
         Severity::Unknown => (Color::White, Color::DarkGray),
     }
+}
+
+fn draw_update_prompt(f: &mut Frame, app: &App, area: Rect) {
+    let r = centered(area, 80, 75);
+    f.render_widget(Clear, r);
+
+    let visible = app.visible_updates();
+    let total = visible.len();
+    let Some(u) = app.current_update() else {
+        let p = Paragraph::new("No updates to view.").block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(app.theme.muted))
+                .title(" Update "),
+        );
+        f.render_widget(p, r);
+        return;
+    };
+
+    let install_hint = match u.component {
+        crate::update::Component::AppleContainer => match crate::update::install_kind() {
+            crate::update::InstallKind::Brew => "I brew upgrade · ",
+            crate::update::InstallKind::Pkg => match &u.asset {
+                Some(_) => "I install (sudo) · D download · ",
+                None => "",
+            },
+        },
+        crate::update::Component::CguiSelf => match crate::update::cgui_install_method() {
+            crate::update::CguiInstallMethod::Brew => "I brew upgrade · ",
+            crate::update::CguiInstallMethod::Cargo => "I cargo hint · ",
+            crate::update::CguiInstallMethod::Binary => match &u.asset {
+                Some(_) => "I replace binary · D download · ",
+                None => "I (no asset — `cargo install`) · ",
+            },
+        },
+    };
+    let title = format!(
+        " Update · {} · {}/{} · {install_hint}O open · L later · ←→ · Esc ",
+        u.component.label(),
+        app.update_modal_idx.min(total.saturating_sub(1)) + 1,
+        total
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(app.theme.info))
+        .title(Span::styled(
+            title,
+            Style::default().fg(app.theme.info).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(r);
+    f.render_widget(block, r);
+
+    // Header (versions + url + published) on top, notes pane below.
+    let split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(6), Constraint::Min(1)])
+        .split(inner);
+
+    let header = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled("Component:  ", Style::default().fg(app.theme.muted)),
+            Span::styled(
+                u.component.label(),
+                Style::default().fg(app.theme.info).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Installed:  ", Style::default().fg(app.theme.muted)),
+            Span::styled(u.installed.clone(), Style::default().fg(app.theme.warning)),
+            Span::raw("    "),
+            Span::styled("Latest:  ", Style::default().fg(app.theme.muted)),
+            Span::styled(
+                u.latest.clone(),
+                Style::default().fg(app.theme.success).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("    "),
+            Span::styled("Published:  ", Style::default().fg(app.theme.muted)),
+            Span::styled(
+                short_date(&u.published_at),
+                Style::default().fg(app.theme.primary),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("URL:        ", Style::default().fg(app.theme.muted)),
+            Span::styled(
+                u.release_url.clone(),
+                Style::default().fg(app.theme.accent).add_modifier(Modifier::UNDERLINED),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "release notes:",
+            Style::default().fg(app.theme.muted),
+        )),
+    ])
+    .block(
+        Block::default()
+            .borders(Borders::BOTTOM)
+            .border_style(Style::default().fg(app.theme.muted)),
+    );
+    f.render_widget(header, split[0]);
+
+    let notes = if u.notes.is_empty() {
+        "(no release notes)".to_string()
+    } else {
+        u.notes.clone()
+    };
+    let body = Paragraph::new(notes)
+        .wrap(Wrap { trim: false })
+        .scroll((app.update_notes_scroll, 0));
+    f.render_widget(body, split[1]);
+}
+
+fn short_date(s: &str) -> String {
+    // "2026-04-30T17:55:36Z" → "2026-04-30"
+    s.split('T').next().unwrap_or(s).to_string()
+}
+
+fn draw_stack_diff(f: &mut Frame, app: &App, area: Rect) {
+    let r = centered(area, 90, 80);
+    f.render_widget(Clear, r);
+    let target = app.stack_diff_target.as_deref().unwrap_or("?");
+    let total = app.stack_diff_rows.len();
+    let mismatches = app
+        .stack_diff_rows
+        .iter()
+        .filter(|r| !matches!(r, crate::stacks::DiffRow::Match { .. }))
+        .count();
+    let orphans = app
+        .stack_diff_rows
+        .iter()
+        .filter(|r| matches!(r, crate::stacks::DiffRow::Orphan { .. }))
+        .count();
+    let orphan_tag = if orphans > 0 {
+        format!(" · {orphans} orphan{}", if orphans == 1 { "" } else { "s" })
+    } else {
+        String::new()
+    };
+    let title = format!(
+        " Diff · {} · {}/{} matched{orphan_tag} · ↑↓ scroll · Esc close ",
+        target,
+        total - mismatches,
+        total
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if mismatches == 0 {
+            app.theme.success
+        } else {
+            app.theme.warning
+        }))
+        .title(Span::styled(
+            title,
+            Style::default().fg(app.theme.accent).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(r);
+    f.render_widget(block, r);
+
+    let mut lines: Vec<Line> = Vec::with_capacity(total + 1);
+    let mut last_service: Option<String> = None;
+    for row in &app.stack_diff_rows {
+        let svc: String = match row {
+            crate::stacks::DiffRow::Match { service, .. } => service.clone(),
+            crate::stacks::DiffRow::Differ { service, .. } => service.clone(),
+            crate::stacks::DiffRow::Missing { service, .. } => service.clone(),
+            crate::stacks::DiffRow::NotRunning { service, .. } => service.clone(),
+            // Orphans grouped under a synthetic "<orphans>" section.
+            crate::stacks::DiffRow::Orphan { .. } => "<orphans>".to_string(),
+        };
+        if last_service.as_deref() != Some(svc.as_str()) {
+            if last_service.is_some() {
+                lines.push(Line::from(""));
+            }
+            lines.push(Line::from(Span::styled(
+                format!("[{svc}]"),
+                Style::default().fg(app.theme.info).add_modifier(Modifier::BOLD),
+            )));
+            last_service = Some(svc);
+        }
+        match row {
+            crate::stacks::DiffRow::Match { field, value, .. } => {
+                lines.push(Line::from(vec![
+                    Span::styled("  ✓ ", Style::default().fg(app.theme.success)),
+                    Span::styled(format!("{field:<14}"), Style::default().fg(app.theme.muted)),
+                    Span::raw(value.clone()),
+                ]));
+            }
+            crate::stacks::DiffRow::Differ {
+                field, expected, actual, ..
+            } => {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        "  ⚠ ",
+                        Style::default().fg(app.theme.warning).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(format!("{field:<14}"), Style::default().fg(app.theme.muted)),
+                    Span::styled("expected ", Style::default().fg(app.theme.muted)),
+                    Span::styled(
+                        if expected.is_empty() { "<empty>".to_string() } else { expected.clone() },
+                        Style::default().fg(app.theme.success),
+                    ),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::raw("                     "),
+                    Span::styled("actual   ", Style::default().fg(app.theme.muted)),
+                    Span::styled(
+                        if actual.is_empty() { "<empty>".to_string() } else { actual.clone() },
+                        Style::default().fg(app.theme.danger),
+                    ),
+                ]));
+            }
+            crate::stacks::DiffRow::Missing { expected_image, .. } => {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        "  ✗ ",
+                        Style::default().fg(app.theme.danger).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("missing       ", Style::default().fg(app.theme.muted)),
+                    Span::styled(
+                        "no container — `u` to bring up",
+                        Style::default().fg(app.theme.muted),
+                    ),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::raw("                     "),
+                    Span::styled("expected_image ", Style::default().fg(app.theme.muted)),
+                    Span::styled(expected_image.clone(), Style::default().fg(app.theme.info)),
+                ]));
+            }
+            crate::stacks::DiffRow::NotRunning { status, .. } => {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        "  ! ",
+                        Style::default().fg(app.theme.warning).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("status        ", Style::default().fg(app.theme.muted)),
+                    Span::styled(status.clone(), Style::default().fg(app.theme.warning)),
+                ]));
+            }
+            crate::stacks::DiffRow::Orphan { name, status } => {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        "  ⊗ ",
+                        Style::default().fg(app.theme.danger).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(format!("{name:<24}"), Style::default().fg(app.theme.warning)),
+                    Span::styled(status.clone(), Style::default().fg(app.theme.muted)),
+                    Span::styled(
+                        "  (no matching service in TOML — `cgui rm` to clean up)",
+                        Style::default().fg(app.theme.muted),
+                    ),
+                ]));
+            }
+        }
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "(no diff data)",
+            Style::default().fg(app.theme.muted),
+        )));
+    }
+    let p = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((app.stack_diff_scroll, 0));
+    f.render_widget(p, inner);
 }
 
 fn short_digest(d: &str) -> String {

@@ -83,6 +83,12 @@ pub enum Mode {
     TrivyResult,
     /// Confirm prompt
     Confirm,
+
+    /// Phase-2 update prompt: shows release notes and lets the user dismiss
+    /// or open the release URL. No download/install yet.
+    UpdatePrompt,
+    /// Live diff between a stack file and the running containers.
+    StackDiff,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -92,6 +98,7 @@ pub enum OperationKind {
     Trivy,
     StackUp,
     StackDown,
+    UpdateDownload,
 }
 
 impl OperationKind {
@@ -102,6 +109,7 @@ impl OperationKind {
             OperationKind::Trivy => "scan",
             OperationKind::StackUp => "stack up",
             OperationKind::StackDown => "stack down",
+            OperationKind::UpdateDownload => "download",
         }
     }
     pub fn participle(self) -> &'static str {
@@ -111,6 +119,7 @@ impl OperationKind {
             OperationKind::Trivy => "Scanning",
             OperationKind::StackUp => "Bringing up",
             OperationKind::StackDown => "Tearing down",
+            OperationKind::UpdateDownload => "Downloading",
         }
     }
     pub fn done(self) -> &'static str {
@@ -120,6 +129,7 @@ impl OperationKind {
             OperationKind::Trivy => "Scanned",
             OperationKind::StackUp => "Stack up",
             OperationKind::StackDown => "Stack down",
+            OperationKind::UpdateDownload => "Downloaded",
         }
     }
 }
@@ -293,6 +303,40 @@ pub struct App {
     /// Healthcheck state per (stack, service). Driven by the background
     /// healthcheck/restart task.
     pub health: HashMap<(String, String), HealthEntry>,
+
+    /// True when the active runtime profile came from a CLI `--profile`
+    /// override. We then skip writing it back to `state.json` on save so
+    /// the override stays one-shot.
+    pub profile_overridden: bool,
+
+    /// Available upgrades for runtime / cgui itself, populated by the
+    /// background update-check task. Empty unless `prefs.auto_update_check`
+    /// is true and a newer release exists.
+    pub updates: Vec<crate::update::UpdateInfo>,
+    /// Component labels the user dismissed *for this session* via
+    /// `[L]ater`. Filtered out of chip rendering; cleared on restart.
+    pub dismissed_updates: HashSet<String>,
+    /// Index into `visible_updates()` for the modal.
+    pub update_modal_idx: usize,
+    /// Scroll offset in the modal's release-notes pane.
+    pub update_notes_scroll: u16,
+
+    /// Where the most recent successful update download landed. Used by
+    /// phase 4 (`installer`) and surfaced in the status bar after `[D]ownload`.
+    pub download_result: Arc<Mutex<Option<std::path::PathBuf>>>,
+
+    /// Live-diff modal state.
+    pub stack_diff_rows: Vec<crate::stacks::DiffRow>,
+    pub stack_diff_target: Option<String>,   // stack name being diffed
+    pub stack_diff_scroll: u16,
+
+    /// True when `[I]nstall` queued a download — the reaper triggers the
+    /// install dance as soon as the download lands. Cleared after attempt.
+    pub install_after_download: bool,
+    /// Component the queued install targets (so we know whose latest
+    /// version to verify after `installer` exits).
+    pub install_component: Option<crate::update::Component>,
+    pub install_expected: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -411,6 +455,18 @@ impl App {
             trivy_search_active: false,
             trivy_json: Arc::new(Mutex::new(String::new())),
             health: HashMap::new(),
+            profile_overridden: false,
+            updates: Vec::new(),
+            dismissed_updates: HashSet::new(),
+            update_modal_idx: 0,
+            update_notes_scroll: 0,
+            download_result: Arc::new(Mutex::new(None)),
+            stack_diff_rows: Vec::new(),
+            stack_diff_target: None,
+            stack_diff_scroll: 0,
+            install_after_download: false,
+            install_component: None,
+            install_expected: None,
         }
     }
 
@@ -508,6 +564,26 @@ impl App {
         }
     }
 
+    /// Updates not dismissed for the current session. Drives both the
+    /// status-bar chip and the modal cycler.
+    pub fn visible_updates(&self) -> Vec<&crate::update::UpdateInfo> {
+        self.updates
+            .iter()
+            .filter(|u| !self.dismissed_updates.contains(u.component.label()))
+            .collect()
+    }
+
+    /// Current update for the modal, clamped if items were dismissed.
+    pub fn current_update(&self) -> Option<crate::update::UpdateInfo> {
+        let v = self.visible_updates();
+        if v.is_empty() {
+            None
+        } else {
+            let i = self.update_modal_idx.min(v.len() - 1);
+            Some(v[i].clone())
+        }
+    }
+
     /// Activate a runtime profile and persist it.
     pub fn select_profile(&mut self, idx: usize) {
         if let Some(p) = self.profiles.get(idx).cloned() {
@@ -523,7 +599,12 @@ impl App {
         self.prefs.tab = Some(self.tab.key().to_string());
         self.prefs.show_all = Some(self.show_all);
         self.prefs.sort = self.sort_keys.clone();
-        self.prefs.profile = Some(runtime::name());
+        // Skip profile when it came from a `--profile` CLI override —
+        // those are explicitly one-shot and shouldn't clobber the saved
+        // pref.
+        if !self.profile_overridden {
+            self.prefs.profile = Some(runtime::name());
+        }
         self.prefs.save();
     }
 

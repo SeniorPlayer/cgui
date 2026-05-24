@@ -18,6 +18,8 @@ with a **Docker-compatible command shim** so muscle memory keeps working.
  q quit · ←→ tabs · ↑↓ select · r refresh · s start · x stop · K kill · d delete · l logs · a all
 ```
 
+> **Prefer a GUI?** [`cgui-visual`](https://github.com/elementalcollision/cgui-visual) is the visual companion — native macOS desktop app, same workflows, reads the same `~/.config/cgui/stacks/*.toml`. Use either or both.
+
 ## Why
 
 Apple's `container` is great but CLI-only. `cgui` gives you:
@@ -182,6 +184,29 @@ In the TUI: `u` brings the stack up (`container run -d --name <stack>_<service> 
 
 A starter `example.toml` is dropped on first run. The Stacks tab's `Enter` opens a detail pane showing the parsed services and the exact `container run` plan.
 
+#### Templates and `cgui new`
+
+```bash
+cgui templates                         # list built-in templates
+cgui new myapp --template postgres+api # scaffold ~/.config/cgui/stacks/myapp.toml
+cgui new cache  --template redis
+cgui new web    --template nginx
+cgui new minimal                       # default: blank
+```
+
+Built-in templates: `blank`, `postgres`, `postgres+api`, `redis`, `nginx`. Each is a hand-tuned starting point with sane healthchecks, restart policy, and per-stack volume names interpolated from the stack name. Editing afterwards is expected — templates aren't a generator, just a head start. Errors out on collision so you can't clobber an existing stack.
+
+#### Live diff (`=`)
+
+Press `=` on a Stacks row to compute a **live diff** between the TOML on disk and the actual running containers. cgui calls `container inspect <stack>_<service>` for each service and compares: image reference, published ports (sorted), per-key env, attached network, plus container status. The modal shows:
+
+- `✓ field          value` when TOML matches runtime
+- `⚠ field          expected X / actual Y` when they drift
+- `✗ missing        no container — u to bring up` when the service has never been run
+- `! status         exited` when the container exists but isn't running
+
+Title shows a `<matched>/<total>` counter; the border colors green when everything matches, yellow otherwise. Useful for catching "I edited the TOML but forgot to `D` then `u`" drift, or seeing which env vars from the running container differ from your declarations.
+
 #### Restart policy + healthchecks
 
 Each service can declare a `restart` policy and a `healthcheck` block:
@@ -204,9 +229,10 @@ interval_s = 30             # default 30
 For `kind = "http"` the `target` accepts:
 - a bare port (`"8080"`) — probes `http://127.0.0.1:8080/`
 - `PORT/PATH` (`"8080/healthz"`) — probes `http://127.0.0.1:8080/healthz`
-- a full URL (`"http://example.com:8080/v1/ping"`) — used verbatim
+- a full HTTP URL (`"http://example.com:8080/v1/ping"`) — hand-rolled HTTP/1.0 client over `tokio::TcpStream`, no extra deps
+- a full **HTTPS URL** (`"https://example.com/v1/ping"`) — shells out to `curl --silent --max-time 2 -o /dev/null -w "%{http_code}"` so we get TLS without pulling in `rustls`/`native-tls`. macOS `curl` covers it.
 
-Probes use a tiny built-in HTTP/1.0 client (no extra deps, no TLS); success is any status in `expect_status[0]..=expect_status[1]`, defaulting to `200..399`.
+Success is any status in `expect_status[0]..=expect_status[1]`, defaulting to `200..399`.
 
 A background loop (every ~10 s) checks each service's container state. If the policy is `always`, any stopped/exited container is restarted; `on-failure` only restarts on a non-zero exit. The `HEALTH` and `RESTART` columns on the Stacks tab show the rolled-up state per stack:
 
@@ -218,6 +244,58 @@ The detail pane (Enter on a stack) shows per-service health probe results with t
 #### Live reload
 
 Stack files are watched via FSEvents on macOS. Editing a `*.toml` in `~/.config/cgui/stacks/` triggers an automatic reload — no need to press `r` or restart the TUI. New files appear immediately; deleted files vanish on the next refresh tick.
+
+### Update detection
+
+cgui checks for newer releases of Apple's `container` runtime and of cgui itself, once per startup, against the public GitHub Releases API. Results are cached in `state.json` for 24 hours.
+
+When something is behind, an `⬆ container 0.12.3 → 0.13.0 · U to view` chip appears in the status bar (one per component). Press `U` to open the **update prompt** — a centered modal showing:
+
+- component, installed → latest, published date, release URL
+- the first ~80 lines of the GitHub release notes (scrollable with ↑↓/PgUp/PgDn)
+
+Inside the modal:
+
+- `O` opens the release URL in your default browser (`open <url>` on macOS)
+- `D` **downloads** the signed installer `.pkg` to `~/Library/Caches/cgui/` — see below
+- `L` dismisses *that component* for the rest of the session (the chip vanishes; comes back next launch)
+- `←` / `→` (or `n` / `p`) cycle if multiple components are behind
+- `Esc` closes the modal
+
+#### `[D]ownload`
+
+Spawns `curl -fL --silent` for the release's `*-installer-signed.pkg` asset (the **signed** variant only — cgui deliberately refuses the unsigned `.pkg` so the install path stays safe by default). Writes to `~/Library/Caches/cgui/<asset-name>` via a `.part` tempfile that's atomically renamed on success; partial downloads are removed on any failure or size mismatch.
+
+Progress streams into the same modal we use for pull/build/scan: a "Downloading container 0.13.0…" header plus a once-a-second `12.4 MiB / 68.0 MiB (18.2%)` line. Cache reuse is automatic — re-running `[D]` on a release whose `.pkg` is already in the cache (and matches the API-reported size exactly) skips the download and reports `✓ cached at <path>` immediately.
+
+Phase 4 will use the cached path to invoke `sudo installer -pkg <path> -target /`. Phase 3 stops at "downloaded" — nothing is run with elevated privileges.
+
+#### `[I]nstall`
+
+Pressing `I` in the update modal kicks off the install path. cgui auto-detects how the runtime was installed and picks the right route:
+
+- **`.pkg` install** (the default — runtime under `/usr/local/`): cgui chains `[D]` first if the asset isn't cached, then **suspends the TUI** (leaves alt-screen + raw mode) and runs `sudo installer -pkg <cached-pkg> -target /`. The `sudo` password prompt and installer's progress land on your real terminal — cgui doesn't intercept either. The TUI is restored on exit.
+- **Homebrew install** (binary under `/opt/homebrew/Cellar/` or `/usr/local/Cellar/`): no download, no sudo. cgui suspends the TUI and runs `brew upgrade container` so brew's chatty output is visible.
+
+Either path is followed by a **post-install verify**: cgui re-runs `container --version`, parses it, and compares to the expected `latest`. On a confirmed upgrade the chip vanishes immediately and the status bar reads `✓ upgraded container to 0.13.0`. On version mismatch (`installer` claimed success but the version didn't change) you get `⚠ installer ran but container is X (expected Y)` so you can investigate.
+
+Failure modes are explicit: download failed → `install cancelled (download failed)`; installer non-zero exit → `installer exited <status>`; sudo cancelled → no version change reported. The cached `.pkg` is left in place so you can retry without re-downloading.
+
+#### cgui self-update
+
+cgui can also upgrade itself. The route depends on how you installed it (auto-detected from `current_exe()`):
+
+- **Standalone binary** (the default): `[I]` downloads the matching release asset (preferring `cgui-<arch>-apple-<os>` archives, falling back to a bare `cgui` binary) and **atomic-replaces** the running binary via `std::fs::rename`. POSIX guarantees this is safe even on a running process — the kernel keeps the old inode mapped while cgui keeps running. After the rename, the status bar reads `✓ replaced cgui binary — restart to use 0.13.0`. No sudo, no terminal teardown.
+- **Homebrew install** (binary under `/opt/homebrew/Cellar/`): `brew upgrade cgui`, same suspended-TUI pattern as the runtime brew path.
+- **Cargo install** (binary under `~/.cargo/bin/`): cgui won't muck with cargo state. The status bar surfaces `cargo-installed cgui — upgrade with cargo install cgui --force` and lets you run it yourself.
+
+Tarballs (`*.tar.gz` / `*.tgz` / `*.tar`) are extracted via the system `tar` binary and the `cgui` file is located inside (any depth). The new binary is staged at `<current_exe>.new` with mode 0755, then renamed over the running file. Failures clean up the `.new` tempfile and the extraction tmp dir; the running process is untouched.
+
+`cgui doctor` includes the same information without launching the TUI; `cgui update` forces a fresh API hit (bypasses the 24h cache and the opt-out).
+
+Disable entirely with `cgui --no-update` (persists `auto_update_check = false` in `state.json`). The opt-out is honoured by the background check and `cgui doctor`; the explicit `cgui update` subcommand always runs.
+
+Network: macOS's built-in `curl` is used so no extra dependency is added; calls are bounded by an 8-second timeout and skipped silently on failure.
 
 ### `cgui doctor`
 
@@ -349,14 +427,51 @@ State refresh is async and best-effort: if one source (e.g. `volume ls`) fails, 
 | HTTP healthcheck kind                                 | ✅ shipped | 0.12.0         |
 | Per-service log multiplex (`L` on Stacks)             | ✅ shipped | 0.12.0         |
 | Trivy CVE search bar (`/` in results modal)           | ✅ shipped | 0.12.0         |
+| Update detection (status chip + `cgui doctor` row)    | ✅ shipped | 0.13.0         |
+| Update prompt modal (`U`, `[O]pen`, `[L]ater`)        | ✅ shipped | 0.13.1         |
+| Update download (`[D]`) to `~/Library/Caches/cgui/`   | ✅ shipped | 0.13.2         |
+| Update install (`[I]`) — sudo installer / brew + verify | ✅ shipped | 0.13.3       |
+| cgui self-update — atomic-replace / brew / cargo hint | ✅ shipped | 0.13.4         |
+| Stack templates + `cgui new`                          | ✅ shipped | 0.14.0         |
+| HTTPS healthcheck (`https://…` target via `curl`)     | ✅ shipped | 0.14.0         |
+| Live stack diff (`=` on Stacks tab)                   | ✅ shipped | 0.14.0         |
+| Pull/build progress targets Apple `--progress=plain` grammar (gated by runtime) | ✅ shipped | 0.14.1 |
+| Per-tab refresh cadence (skip 2 s tick on Logs + follow) | ✅ shipped | 0.14.2 |
+| `y` copies pull/build/log buffer to `pbcopy`           | ✅ shipped | 0.14.2 |
+| `--profile <name>` one-shot CLI override (no persist)  | ✅ shipped | 0.14.2 |
+| Stack `cap_add` / `cap_drop` passthrough              | ✅ shipped | 0.14.2 |
+| Healthcheck `start_period_s` startup grace             | ✅ shipped | 0.14.2 |
+| Stack diff: orphan container detection (`⊗`)           | ✅ shipped | 0.14.2 |
 | Optional GUI front end (Tauri)                        | 🟡 planned | —              |
 
 ## Roadmap
 
-- Optional GUI front end (Tauri) sharing the same `container.rs` core
-- HTTPS healthcheck (currently plain HTTP only)
-- Live diff view between stack file on disk and running containers
-- Stack templates / presets (`cgui new myapp --template postgres+api`)
+The previous roadmap (HTTPS healthcheck · live stack diff · stack templates) shipped in 0.14.0 — see the progress table above. The next backlog comes from the post-0.14 project review and is grouped by priority.
+
+### High priority
+
+- **CI on push + tag** — `.github/workflows/` for `cargo test --release` + `cargo clippy -- -D warnings` on every push, `cargo fmt --check`, and a release workflow that builds **both** `cgui-aarch64-apple-darwin.tar.gz` and `cgui-x86_64-apple-darwin.tar.gz` and uploads them as assets on tag push (Intel Mac users currently can't self-update).
+- **Integration test for the update modal flow** — phases 1–5 are live but never exercised end-to-end (we're always on `latest`). A test that constructs an `App` with a synthetic `UpdateInfo` and walks `U` / `D` / `L` / `Esc` / cycling through `handle_key` would verify the dispatch table.
+- **Real-binary smoke test** — `tests/smoke.rs` invoking the release binary with `cgui doctor`, `cgui templates`, `cgui update` and asserting exit codes + key strings.
+
+### Medium priority
+
+- **Refactor `main.rs` (1,775 LOC) and `ui.rs` (1,725 LOC)** — split into `events::{keys, mouse}`, `actions/*`, and `ui/overlays/*`. Defer until the next feature cycle creates real friction.
+- **Status-bar message TTL** — dim after 5 s, drop after 30 s back to `default_status()`. `app.status_set_at` is already tracked; just plumb it.
+- **Persist `dismissed_updates` across sessions** — optionally store `[updates] dismissed = ["container@0.13.0"]` in `state.json`, auto-clear when a newer version supersedes the dismissed one.
+- **`cgui doctor --json` / `--quiet`** — machine-readable output for CI / pre-commit / shell pipelines.
+- **`compose import` strict mode** — surface dropped keys (`build:`, `secrets:`, `configs:`, `deploy:`, `cap_add:`, etc.) on stderr; `--strict` errors out.
+
+### Low priority / nice to have
+
+(Cleared in 0.14.2.) Suggestions welcome — open an issue.
+
+### Out of scope (deliberately not planned)
+
+- **Tauri GUI** — sharing `container.rs` between two front ends never stays in sync. Removed from the roadmap unless a maintainer steps up.
+- **Compose `build:` field** — that's a build orchestrator, not a runner. Use `b` then reference the tag.
+- **Daemon for update checks** — the current "one check at startup + 24 h cache" is correct. A launchd plist would add complexity for negligible UX gain.
+- **Plugin system** — premature for an 8.7 k LOC tool.
 
 ## License
 
