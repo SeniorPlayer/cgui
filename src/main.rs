@@ -27,6 +27,7 @@ use crossterm::{
 use futures::StreamExt;
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::{io::stdout, time::Duration};
+use std::os::unix::io::AsRawFd;
 use tokio::time::{interval, MissedTickBehavior};
 
 use crate::app::{App, ContextAction, ContextMenu, Mode, OperationKind, Tab};
