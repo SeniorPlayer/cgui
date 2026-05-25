@@ -1913,7 +1913,7 @@ async fn exec_shell<B: ratatui::backend::Backend>(
 
     // Try sh; the user can re-run this if they want bash.
     let status = std::process::Command::new("container")
-        .args(["exec", "-ti", &id, "/bin/sh"])
+        .args(["exec", "-ti", &id, "sh", "-c", "command -v fish >/dev/null 2>&1 && exec fish || exec sh"])
         .status();
 
     enter_terminal()?;
