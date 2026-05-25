@@ -1916,6 +1916,7 @@ async fn exec_shell<B: ratatui::backend::Backend>(
         .status();
 
     enter_terminal()?;
+    set_blocking(&std::io::stderr(), true)?;   // 恢复阻塞
     term.clear()?;
 
     match status {
@@ -1924,5 +1925,22 @@ async fn exec_shell<B: ratatui::backend::Backend>(
         Err(e) => app.set_status(format!("exec {id}: spawn error: {e}")),
     }
     refresh_now(app).await;
+    Ok(())
+}
+
+fn set_blocking(fd: &impl AsRawFd, blocking: bool) -> std::io::Result<()> {
+    let fd = fd.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let flags = if blocking {
+        flags & !libc::O_NONBLOCK
+    } else {
+        flags | libc::O_NONBLOCK
+    };
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
     Ok(())
 }
