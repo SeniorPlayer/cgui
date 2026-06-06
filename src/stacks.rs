@@ -12,6 +12,8 @@
 //! name = "db"
 //! image = "docker.io/pgvector/pgvector:pg16"
 //! env = { POSTGRES_USER = "test", POSTGRES_PASSWORD = "test" }
+//! cpus = "2"
+//! memory = "2G"
 //! ports = ["15432:5432"]
 //! volumes = ["dbdata:/var/lib/postgresql/data"]
 //! network = "default"
@@ -41,6 +43,8 @@ pub struct Stack {
 pub struct Service {
     pub name: String,
     pub image: String,
+    pub cpus: Option<String>,
+    pub memory: Option<String>,
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
     #[serde(default)]
@@ -168,6 +172,14 @@ pub fn run_args(stack: &str, svc: &Service) -> Vec<String> {
     if let Some(n) = &svc.network {
         a.push("--network".into());
         a.push(n.clone());
+    }
+    if let Some(cpus) = &svc.cpus {
+        a.push("--cpus".into());
+        a.push(cpus.clone());
+    }
+    if let Some(memory) = &svc.memory {
+        a.push("--memory".into());
+        a.push(memory.clone());
     }
     for cap in &svc.cap_add {
         a.push("--cap-add".into());
