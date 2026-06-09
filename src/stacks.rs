@@ -149,9 +149,9 @@ pub fn stacks_dir() -> Option<PathBuf> {
     Some(base.join("cgui").join("stacks"))
 }
 
-/// Container name prefix: `<stack>_<service>`.
+/// Container name prefix: `<stack>-<service>`.
 pub fn container_name(stack: &str, service: &str) -> String {
-    format!("{stack}_{service}")
+    format!("{stack}-{service}")
 }
 
 /// Build the `container run` argv for a single service.
