@@ -138,6 +138,7 @@ fn parse_container(v: Value) -> Container {
         .to_string();
     let status = v
         .get("status")
+        .and_then(|s| s.get("state"))
         .and_then(|x| x.as_str())
         .unwrap_or("unknown")
         .to_string();
@@ -182,12 +183,14 @@ pub async fn list_images() -> Result<Vec<Image>> {
         .into_iter()
         .map(|v| Image {
             reference: v
-                .get("reference")
+                .get("configuration")
+                .and_then(|c| c.get("name"))
                 .and_then(|x| x.as_str())
                 .unwrap_or("?")
                 .to_string(),
             size: v
-                .get("fullSize")
+                .get("variants")
+                .and_then(|v| v.get("size"))
                 .and_then(|x| x.as_str())
                 .unwrap_or("?")
                 .to_string(),
@@ -211,17 +214,21 @@ pub async fn list_volumes() -> Result<Vec<Volume>> {
         .into_iter()
         .map(|v| Volume {
             name: v
-                .get("name")
+                .get("configuration")
+                .and_then(|c| c.get("name"))
                 .and_then(|x| x.as_str())
                 .unwrap_or("?")
                 .to_string(),
             driver: v
-                .get("driver")
+                .get("configuration")
+                .and_then(|c| c.get("driver"))
                 .and_then(|x| x.as_str())
                 .unwrap_or("local")
                 .to_string(),
             source: v
-                .get("source")
+                .get("configuration")
+                .and_then(|c| c.get("options"))
+                .and_then(|c| c.get("size"))
                 .and_then(|x| x.as_str())
                 .unwrap_or("")
                 .to_string(),
@@ -235,7 +242,7 @@ pub async fn list_networks() -> Result<Vec<Network>> {
     Ok(raw
         .into_iter()
         .map(|v| {
-            let cfg = v.get("config").cloned().unwrap_or(Value::Null);
+            let cfg = v.get("configuration").cloned().unwrap_or(Value::Null);
             Network {
                 id: v
                     .get("id")
