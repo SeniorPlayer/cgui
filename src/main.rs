@@ -1925,7 +1925,6 @@ async fn exec_shell<B: ratatui::backend::Backend>(
         Ok(s) => app.set_status(format!("exec {id}: exited {s}")),
         Err(e) => app.set_status(format!("exec {id}: spawn error: {e}")),
     }
-    refresh_now(app).await;
     Ok(())
 }
 
