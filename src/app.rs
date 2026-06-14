@@ -646,7 +646,7 @@ impl App {
     pub fn stats_by_id(&self) -> HashMap<String, (f64, u64, u64)> {
         let mut m = HashMap::with_capacity(self.stats.len());
         for s in &self.stats {
-            let key = if !s.id.is_empty() { &s.id } else { &s.name };
+            let key = &s.id;
             if !key.is_empty() {
                 m.insert(key.clone(), (s.cpu_percent, s.memory_usage, s.memory_limit));
             }
@@ -807,7 +807,7 @@ impl App {
             let used: u64 = v.iter().map(|s| s.memory_usage).sum();
             let limit: u64 = v.iter().map(|s| s.memory_limit).sum();
             for s in &v {
-                let key = if !s.id.is_empty() { &s.id } else { &s.name };
+                let key = &s.id;
                 if key.is_empty() {
                     continue;
                 }

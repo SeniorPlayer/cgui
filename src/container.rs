@@ -66,7 +66,6 @@ pub struct Network {
 #[serde(default)]
 pub struct StatRow {
     pub id: String,
-    pub name: String,
     #[serde(rename = "cpuUsageUsec", alias = "cpu_usage_usec", alias = "CPU_USAGE")]
     pub cpu_usage_usec: u64,
     pub cpu_usage_usec_last: u64,
@@ -190,12 +189,14 @@ pub async fn list_images() -> Result<Vec<Image>> {
                 .to_string(),
             size: v
                 .get("variants")
+                .and_then(|v| v.get(0))
                 .and_then(|v| v.get("size"))
                 .and_then(|x| x.as_str())
                 .unwrap_or("?")
                 .to_string(),
             digest: v
-                .get("descriptor")
+                .get("configuration")
+                .and_then(|c| c.get("descriptor"))
                 .and_then(|d| d.get("digest"))
                 .and_then(|x| x.as_str())
                 .unwrap_or("")

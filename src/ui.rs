@@ -215,10 +215,8 @@ fn draw_containers(f: &mut Frame, app: &mut App, area: Rect) {
                     )
                 }
                 None => (
-                    Cell::from(format!("    {}", c.cpus))
-                        .style(Style::default().fg(Color::DarkGray)),
-                    Cell::from(format_size(c.memory_bytes, BINARY))
-                        .style(Style::default().fg(Color::DarkGray)),
+                    Cell::from(format!("    {}", c.cpus)),
+                    Cell::from(format_size(c.memory_bytes, BINARY)),
                 ),
             };
 
@@ -374,7 +372,7 @@ fn draw_images(f: &mut Frame, app: &mut App, area: Rect) {
             Row::new(vec![
                 Cell::from(im.reference.clone()).style(Style::default().fg(Color::Blue)),
                 Cell::from(im.size.clone()),
-                Cell::from(short_digest(&im.digest)).style(Style::default().fg(Color::DarkGray)),
+                Cell::from(short_digest(&im.digest)),
             ])
         })
         .collect();
@@ -395,7 +393,7 @@ fn draw_images(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_volumes(f: &mut Frame, app: &mut App, area: Rect) {
-    let header = Row::new(vec!["NAME", "DRIVER", "SOURCE"]).style(header_style());
+    let header = Row::new(vec!["NAME", "DRIVER", "SIZE"]).style(header_style());
     let view = app.view_indices();
     let rows: Vec<Row> = view
         .iter()
@@ -404,7 +402,7 @@ fn draw_volumes(f: &mut Frame, app: &mut App, area: Rect) {
             Row::new(vec![
                 Cell::from(v.name.clone()),
                 Cell::from(v.driver.clone()),
-                Cell::from(v.source.clone()).style(Style::default().fg(Color::DarkGray)),
+                Cell::from(v.source.clone()),
             ])
         })
         .collect();
@@ -440,7 +438,7 @@ fn draw_networks(f: &mut Frame, app: &mut App, area: Rect) {
                 Cell::from(n.id.clone()),
                 Cell::from(n.mode.clone()),
                 Cell::from(n.state.clone()).style(state_style),
-                Cell::from(n.subnet.clone()).style(Style::default().fg(Color::DarkGray)),
+                Cell::from(n.subnet.clone()),
             ])
         })
         .collect();
